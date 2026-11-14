@@ -7,6 +7,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from data_pipeline import create_cleaning_report, process_data, validate_dataframe
 from src import HealthResponse, ProcessConfig, log_requests, setup_logging
 from src import (
+    MovieCache,
     MovieStorage,
     MovieUploadInfo,
     MovieDataResponse,
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(title="Data Processing API", version="1.0.0")
 app.middleware("http")(log_requests)
 storage = MovieStorage()
+cache = MovieCache()
 
 @app.get("/health", response_model=HealthResponse)
 def health_check():
@@ -56,6 +58,7 @@ async def upload_movies(file: UploadFile = File(...)):
 
     df = df[MOVIE_COLUMNS]
     storage.save(df)
+    cache.invalidate()
     logger.info("Uploaded movies: filename=%s, rows=%s", file.filename, len(df))
     return MovieUploadInfo(
         filename=file.filename,
@@ -66,11 +69,18 @@ async def upload_movies(file: UploadFile = File(...)):
 
 @app.get("/movies", response_model=MovieDataResponse)
 def get_movies(limit: int = Query(default=100, ge=1)):
-    """Return up to limit stored movies plus the total count."""
+    """Return up to limit stored movies plus the total count, using the cache."""
+    cached = cache.get(limit)
+    if cached is not None:
+        logger.info("Cache hit for movies: limit=%s", limit)
+        return cached
+
     data = storage.select_columns(MOVIE_COLUMNS, limit=limit)
     total_rows = storage.count_movies()
+    response = {"data": data, "total_rows": total_rows}
+    cache.set(limit, response)
     logger.info("Retrieved movies: rows=%s, total_rows=%s", len(data), total_rows)
-    return {"data": data, "total_rows": total_rows}
+    return response
 
 @app.get("/movies/search", response_model=list[dict])
 def query_movies(
@@ -123,6 +133,7 @@ def process_movies(config: ProcessConfig):
         raise HTTPException(status_code=400, detail=str(error)) from error
 
     storage.save(processed)
+    cache.invalidate()
     logger.info(
         "Processed movies: validation_removed=%s, rows_before=%s, rows_after=%s",
         validation_rows_removed,
